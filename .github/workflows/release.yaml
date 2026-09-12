@@ -1,0 +1,137 @@
+# Release: tag v*.*.* → kernel image on GHCR + hedronos binaries on the GitHub Release.
+#
+# The tag is Evan's. This file only lands the machinery.
+#
+# GHCR namespace: this repo lives under the VirtualMachinist account, but the
+# kernel image is published as ghcr.io/hedronite/hedronos-kernel (SoT plan
+# 2026-09-12 LOCKS). GITHUB_TOKEN can only publish into the repo owner's own
+# namespace, so publishing into the Hedronite org needs a PAT with
+# write:packages stored as the repository secret GHCR_TOKEN (plus GHCR_USERNAME,
+# the PAT owner). Without those secrets the job falls back to GITHUB_TOKEN and
+# the repository variable GHCR_NAMESPACE (default: hedronite) must point at a
+# namespace that token can write to (e.g. virtualmachinist). See RELEASING.md.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  GHCR_NAMESPACE: ${{ vars.GHCR_NAMESPACE || 'hedronite' }}
+
+jobs:
+  kernel-image:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USERNAME || github.actor }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Image name
+        id: meta
+        run: |
+          ns="$(echo "$GHCR_NAMESPACE" | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/${ns}/hedronos-kernel" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push kernel image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.description=HedronOS kernel (student lab, localhost only)
+          cache-from: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache
+          cache-to: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache,mode=max
+
+  hedronos-binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            suffix: darwin-arm64
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            suffix: darwin-amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            suffix: linux-arm64
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build hedronos
+        run: cargo build --release --locked --manifest-path crates/hedronos/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Stage binary
+        run: |
+          mkdir -p dist
+          cp "crates/hedronos/target/${{ matrix.target }}/release/hedronos" "dist/hedronos-${{ matrix.suffix }}"
+          (cd dist && shasum -a 256 "hedronos-${{ matrix.suffix }}" > "hedronos-${{ matrix.suffix }}.sha256")
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: hedronos-${{ matrix.suffix }}
+          path: dist/hedronos-${{ matrix.suffix }}*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [hedronos-binaries, kernel-image]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: hedronos-*
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            Kernel image: `${{ needs.kernel-image.outputs.image }}:${{ github.ref_name }}`
+
+            Install (macOS / Linux):
+
+                curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash

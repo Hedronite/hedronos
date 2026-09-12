@@ -1,0 +1,55 @@
+# PR checks for the install path: shell lint, kernel image builds, crate tests.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax
+        run: bash -n install.sh && sh -n docker-entrypoint.sh
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning install.sh docker-entrypoint.sh
+
+  kernel-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: hedronos-kernel:ci
+      - name: Compose contract renders
+        run: |
+          docker compose -f compose.yaml config >/dev/null
+          docker compose -f compose.yaml -f compose.dev.yaml config >/dev/null
+      - name: Kernel answers /ready
+        run: |
+          docker run -d --name kernel -p 127.0.0.1:18800:18800 hedronos-kernel:ci
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18800/ready | grep -q '"ok": *true'; then exit 0; fi
+            sleep 1
+          done
+          docker logs kernel; exit 1
+
+  crate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --locked --manifest-path crates/hedronos/Cargo.toml
