@@ -24,7 +24,6 @@
 <p align="center">
   Built by <a href="https://hedronite.com">Hedronite</a>'s
   <a href="https://github.com/VirtualMachinist">VirtualMachinist</a>.
-  Not the mesh. Not Omahedron. Not a hosted fleet.
 </p>
 
 ---
